@@ -490,9 +490,17 @@ const CONFIG = {
   COUNT_STEP_MS: 1000,          // 3→2→1→きれ！ の間隔
   FOUL_FROM_COUNT: 1,           // この数字が出てから合図までに振ると「早すぎ！」（3にすると最初から）
   WAIT_MS: { child: [800, 1700], adult: [400, 900] },    // 合図のあと、お侍さんが斬りかかるまでの時間（ランダム）
-  SWING_RATIO: { child: 0.25, adult: 1.0 },              // 手首が動く距離（胴体の長さに対する倍率）
-  SWING_WINDOW_MS: 500,         // この時間のうちに動いた距離で判定
-  MIN_VISIBILITY: 0.4,          // 骨格の信頼度がこれ未満なら無視
+  /* ── 振りの判定（手が動いた距離を「胴体の長さ」の何倍かで見る） ── */
+  SWING_RATIO: { child: 0.2, adult: 1.0 },               // 「きれ！」のあと：これだけ動けば斬ったことにする（小さいほど反応しやすい）
+  FOUL_RATIO:  { child: 0.6, adult: 1.0 },               // 合図の前：これだけ大きく動いたときだけ「早すぎ！」（大きいほどお手つきしにくい）
+  SWING_WINDOW_MS: 500,         // 「斬った」を見る時間のはば
+  FOUL_WINDOW_MS: 400,          // 「早すぎ」を見る時間のはば（ゆっくり構えるだけなら、お手つきにならない）
+  STRAIGHT_MIN: 0.4,            // 「まっすぐ一方向」の度合い（0〜1）。その場で小刻みに震えるだけの動きは、これで除く
+  CONFIRM_FRAMES: { win: 2, foul: 2 },                   // 何コマ続けて当てはまったら数えるか（1コマだけの誤検出を除く）
+  SMOOTH: 0.6,                  // 手の位置のなめらかさ（1に近いほどそのまま、小さいほどなめらか）
+  ELBOW_GAIN: 1.6,              // 手が見えないとき、ひじの動きを何倍にして手の代わりにするか
+  HAND_MIN_VIS: 0.15,           // 手首・指のうち、この信頼度以上のものを手の位置に使う（長袖で手首が見えにくくても、指で見る）
+  MIN_VISIBILITY: 0.4,          // 骨格の信頼度がこれ未満なら無視（胴体・ひじ用）
   BLAST_MS: { child: 300, adult: 300 },                  // この時間（ミリ秒）より速く斬ると、お侍さんが場外へ吹っ飛ぶ
   REWARD: {                     // 勝ったときの桜（上から）と小判（下から）の数
     normal: { sakura: 26,  koban: 9 },
@@ -924,17 +932,46 @@ const poseReady = (async () => {
     const { PoseLandmarker, FilesetResolver } = await import(CONFIG.VISION_URL);
     const fileset = await FilesetResolver.forVisionTasks(CONFIG.WASM_URL);
     const make = (delegate) => PoseLandmarker.createFromOptions(fileset, {
-      baseOptions: { modelAssetPath: CONFIG.MODEL_URL, delegate }, runningMode: 'VIDEO', numPoses: 1 });
+      baseOptions: { modelAssetPath: CONFIG.MODEL_URL, delegate }, runningMode: 'VIDEO', numPoses: 1,
+      minPoseDetectionConfidence: 0.4, minPosePresenceConfidence: 0.4, minTrackingConfidence: 0.4 });   // 長袖・小さな子でも見失いにくく
     try { landmarker = await make('GPU'); } catch (e) { landmarker = await make('CPU'); }
     return true;
   } catch (e) { console.warn('pose', e); return false; }
 })();
 
-/* 剣を振ったかどうかの判定：手首が「胴体の長さ × 倍率」以上、短い時間に動いたら振った */
+/* 剣を振ったかどうかの判定
+   ・手の位置は、手首だけでなく小指・人差し指・親指も合わせた「手のひら」の位置で見る（長袖で手首が見えにくくても、指でわかる）
+   ・手も指も見えないときは、ひじの動きを大きめに見て代わりにする
+   ・位置は、直前3コマの中央値でパッと飛ぶ誤検出を消し、さらに少しなめらかにして、手の震えやカメラのブレを消す
+   ・「短い時間に」「まっすぐ一方向へ」「胴体の長さに対して十分な距離」動いたときだけ振ったと数える（その場で小刻みに震えるだけでは数えない）
+   ・1コマだけの誤検出は無視して、続けて当てはまったときだけ数える
+   ・「きれ！」のあと（斬った）はゆるく、合図の前（早すぎ）はきびしく見る */
 const detector = {
-  hist: { L: [], R: [] }, torso: 0,
-  reset() { this.hist = { L: [], R: [] }; },
-  update(t, lm, vw, vh, ratio) {
+  hist: { L: [], R: [] },                                             // 画面に光る軌跡を描くための履歴
+  st: null, torso: 0, run: { win: 0, foul: 0 }, runT: { win: 0, foul: 0 },
+  reset() {
+    const side = () => ({ hand: { raw: [], h: [] }, elbow: { raw: [], h: [] } });
+    this.st = { L: side(), R: side() }; this.hist = { L: [], R: [] };
+    this.run = { win: 0, foul: 0 }; this.runT = { win: 0, foul: 0 };
+  },
+  /* 手の位置（手首・指をまとめた位置）と、ひじの位置。見えないものは null */
+  points(lm, vw, vh, side) {
+    const vis = (i) => (lm[i].visibility === undefined ? 1 : lm[i].visibility);
+    const ids = side === 'L' ? [15, 17, 19, 21] : [16, 18, 20, 22];       // 手首・小指・人差し指・親指
+    let sw = 0, sx = 0, sy = 0, vmax = 0;
+    for (const i of ids) {
+      const v = vis(i); if (v < CONFIG.HAND_MIN_VIS) continue;
+      const w = v * v; sw += w; sx += lm[i].x * w; sy += lm[i].y * w; vmax = Math.max(vmax, v);
+    }
+    const e = side === 'L' ? 13 : 14;
+    return {
+      hand: sw > 0 && vmax >= 0.3 ? { x: sx / sw * vw, y: sy / sw * vh } : null,
+      elbow: vis(e) >= CONFIG.MIN_VISIBILITY ? { x: lm[e].x * vw, y: lm[e].y * vh } : null,
+    };
+  },
+  /* 戻り値：{ win, foul }。当てはまったときは「最初に当てはまったコマの時刻」、そうでなければ null */
+  update(t, lm, vw, vh, mode) {
+    if (!this.st) this.reset();
     const vis = (i) => (lm[i].visibility === undefined ? 1 : lm[i].visibility);
     const shoulderW = Math.hypot((lm[11].x - lm[12].x) * vw, (lm[11].y - lm[12].y) * vh);
     let torsoNow = shoulderW * 1.4;                                   // 腰が映っていないときは肩幅から推定
@@ -945,17 +982,45 @@ const detector = {
     }
     this.torso = this.torso ? this.torso * 0.85 + torsoNow * 0.15 : torsoNow;
     const valid = this.torso > vh * 0.08;                             // 小さすぎる（遠すぎる）ときは無効
-    const need = ratio * this.torso;
-    let swung = false;
-    [['L', 15], ['R', 16]].forEach(([key, i]) => {
-      const h = this.hist[key];
-      if (vis(i) < CONFIG.MIN_VISIBILITY) { h.length = 0; return; }
-      const x = lm[i].x * vw, y = lm[i].y * vh;
-      h.push({ t, x, y });
-      while (h.length && t - h[0].t > CONFIG.SWING_WINDOW_MS) h.shift();
-      if (valid) for (const p of h) { if (Math.hypot(x - p.x, y - p.y) >= need) { swung = true; break; } }
-    });
-    return swung;
+    const needWin = CONFIG.SWING_RATIO[mode] * this.torso, needFoul = CONFIG.FOUL_RATIO[mode] * this.torso;
+    const med = (a, b, c) => Math.max(Math.min(a, b), Math.min(Math.max(a, b), c));
+    let winNow = false, foulNow = false, tp = t;
+    for (const key of ['L', 'R']) {
+      const P = this.points(lm, vw, vh, key), S = this.st[key];
+      for (const kind of ['hand', 'elbow']) {                          // 手とひじ、それぞれの動きを記録しておく（どちらかが一瞬見えなくても、動きは残る）
+        const p = P[kind], T = S[kind]; if (!p) continue;
+        if (T.raw.length && t - T.raw[T.raw.length - 1].t > 300) { T.raw.length = 0; T.h.length = 0; }   // 長く途切れたら、やり直し
+        T.raw.push({ t, x: p.x, y: p.y }); if (T.raw.length > 3) T.raw.shift();
+        if (T.raw.length < 3) continue;
+        /* 直前3コマの中央値 → 1コマだけパッと飛んだ誤検出が消える。時刻は真ん中のコマのもの（反応の速さを損なわない） */
+        const r = T.raw, m = { t: r[1].t, x: med(r[0].x, r[1].x, r[2].x), y: med(r[0].y, r[1].y, r[2].y) };
+        if (T.h.length) { const q = T.h[T.h.length - 1], a = CONFIG.SMOOTH; m.x = q.x + (m.x - q.x) * a; m.y = q.y + (m.y - q.y) * a; }   // なめらかに
+        T.h.push(m); tp = m.t;
+        while (T.h.length && t - T.h[0].t > CONFIG.SWING_WINDOW_MS) T.h.shift();
+      }
+      const use = P.hand ? 'hand' : (P.elbow ? 'elbow' : null);      // 手が見えていれば手、見えなければひじで判定
+      this.hist[key] = S.hand.h.length ? S.hand.h : S.elbow.h;
+      if (!use || !valid) continue;
+      const h = S[use].h, gain = use === 'elbow' ? CONFIG.ELBOW_GAIN : 1;
+      if (h.length < 2) continue;
+      const n = h[h.length - 1]; let path = 0;
+      for (let j = h.length - 2; j >= 0; j--) {                        // 新しい方から、むかしの点までさかのぼる
+        path += Math.hypot(h[j].x - h[j + 1].x, h[j].y - h[j + 1].y);
+        const d = Math.hypot(n.x - h[j].x, n.y - h[j].y), straight = path > 0 ? d / path : 0;
+        if (straight < CONFIG.STRAIGHT_MIN) continue;                  // 行ったり来たりの動きは数えない
+        if (d * gain >= needWin) winNow = true;
+        if (n.t - h[j].t <= CONFIG.FOUL_WINDOW_MS && d * gain >= needFoul) foulNow = true;
+      }
+    }
+    for (const k of ['win', 'foul']) {
+      const now = k === 'win' ? winNow : foulNow;
+      this.run[k] = now ? this.run[k] + 1 : 0;
+      if (this.run[k] === 1) this.runT[k] = tp;
+    }
+    return {
+      win: this.run.win >= CONFIG.CONFIRM_FRAMES.win ? this.runT.win : null,
+      foul: this.run.foul >= CONFIG.CONFIRM_FRAMES.foul ? this.runT.foul : null,
+    };
   },
 };
 
@@ -1251,9 +1316,10 @@ function loop() {
     const lm = res && res.landmarks && res.landmarks[0];
     if (lm) {
       S.lastSeen = now;
-      const swung = detector.update(now, lm, video.videoWidth, video.videoHeight, CONFIG.SWING_RATIO[S.mode]);
+      const r = detector.update(now, lm, video.videoWidth, video.videoHeight, S.mode);
       drawOverlay();
-      if (swung) onSwing(now);
+      const hit = S.phase === 'fight' ? r.win : (S.phase === 'countdown' && S.foulArmed ? r.foul : null);   // 合図のあと→斬った／合図の前→早すぎ
+      if (hit != null) onSwing(hit);
     } else { detector.reset(); clearOverlay(); }
     $('#nobody').style.display = now - S.lastSeen > 1200 ? 'block' : 'none';
   }
